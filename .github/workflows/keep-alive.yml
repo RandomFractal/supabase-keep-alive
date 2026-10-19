@@ -1,0 +1,82 @@
+name: Supabase keep-alive
+
+on:
+  # Wakes up every hour; only the hour matching today's random slot pings.
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Ping now, ignoring today''s random slot'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: supabase-keep-alive
+  cancel-in-progress: false
+
+env:
+  # Project URL and table path live in secrets so they stay out of this public
+  # repo and out of its public Actions logs.
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  PING_PATH: ${{ secrets.PING_PATH }}
+  PING_QUERY: select=*&limit=1
+  # Spread of the ping within its chosen hour. Every minute slept is a billed
+  # Actions minute on private repos -- see README for the arithmetic.
+  JITTER_MINUTES: '20'
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether this is today's slot
+        id: slot
+        env:
+          PING_SEED: ${{ secrets.PING_SEED }}
+        run: |
+          read -r slot_hour jitter < <(./scripts/slot.sh)
+          now_hour=$(date -u +%-H)
+          echo "today's slot: ${slot_hour}:00 UTC +${jitter}s (now ${now_hour}:00 UTC)"
+
+          if [[ "${{ inputs.force }}" == 'true' ]]; then
+            echo "run=yes"     >> "$GITHUB_OUTPUT"
+            echo "jitter=0"    >> "$GITHUB_OUTPUT"
+            echo "manual run -- pinging immediately"
+          elif [[ "$now_hour" -eq "$slot_hour" ]]; then
+            echo "run=yes"           >> "$GITHUB_OUTPUT"
+            echo "jitter=${jitter}"  >> "$GITHUB_OUTPUT"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "not today's slot -- nothing to do"
+          fi
+
+      - name: Wait out the jitter
+        if: steps.slot.outputs.run == 'yes' && steps.slot.outputs.jitter != '0'
+        run: sleep ${{ steps.slot.outputs.jitter }}
+
+      - name: Ping Supabase
+        if: steps.slot.outputs.run == 'yes'
+        env:
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: ./scripts/ping.sh
+
+      # Scheduled workflows are disabled after 60 days of repository
+      # inactivity, which would silently kill the pinger. Committing the ping
+      # log keeps the repo active and doubles as a visible record.
+      - name: Record the ping
+        if: steps.slot.outputs.run == 'yes'
+        run: |
+          echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ok" >> log/pings.log
+          tail -n 90 log/pings.log > log/pings.log.tmp
+          mv log/pings.log.tmp log/pings.log
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add log/pings.log
+          git diff --quiet --cached || git commit -m 'chore: record keep-alive ping [skip ci]'
+          git push
